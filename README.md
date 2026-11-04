@@ -962,6 +962,74 @@ Source: [`packages/fff-python/`](./packages/fff-python/).
 
 Native Python bindings built with PyO3. Use them for notebooks, agent scripts, or any Python tool that needs fast file search.
 
+<details id="go-bindings">
+<summary>
+<h2>Go bindings</h2>
+</summary>
+
+### Install
+
+The package wraps the [C library](#c-library) with cgo and finds it through pkg-config. Install the library, put its `fff_c.pc` on `PKG_CONFIG_PATH`, then add the module:
+
+```bash
+# in the fff checkout
+make install PREFIX=$HOME/.local
+commit=$(git rev-parse HEAD)
+
+# in your Go module
+export PKG_CONFIG_PATH=$HOME/.local/lib/pkgconfig
+go get github.com/dmtrKovalenko/fff/go@$commit
+```
+
+The Go module has no version tags of its own, so pin it to the commit the library was built from, as above; a module from another commit may not match the installed `fff.h`. As with C, `$(PREFIX)/lib` must be on the runtime library search path. Linux and macOS are supported; Windows is not.
+
+### Basic usage
+
+```go
+import fff "github.com/dmtrKovalenko/fff/go"
+
+inst, err := fff.New(fff.Options{BasePath: ".", Watch: true})
+if err != nil {
+	log.Fatal(err)
+}
+defer inst.Close()
+inst.WaitForScan(10 * time.Second)
+
+files, err := inst.Search(fff.SearchQuery{Query: "main.go", PageSize: 20})
+if err != nil {
+	log.Fatal(err)
+}
+hits, err := inst.Grep(fff.GrepQuery{
+	Query:       "func New",
+	GrepOptions: fff.GrepOptions{SmartCase: true, Definitions: fff.DefinitionsClassify},
+})
+if err != nil {
+	log.Fatal(err)
+}
+fmt.Println(len(files.Items), len(hits.Matches))
+
+// Watch fails until the watcher is ready.
+if ready, _ := inst.WaitForWatcher(10 * time.Second); ready {
+	id, err := inst.Watch("**/*.go", fff.WatchOptions{}, func(events []fff.WatchEvent) {
+		for _, e := range events {
+			fmt.Println(e.Path)
+		}
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer inst.Unwatch(id)
+}
+```
+
+Search and grep return paths relative to the base path; watch events carry absolute paths. From a checkout, `make test-go` builds the library and runs the tests against it.
+
+Source: [`go/`](./go/).
+
+</details>
+
+cgo bindings over the C library for Go tools and services.
+
 ---
 
 ## What is FFF and why use it over ripgrep or fzf?
@@ -1031,6 +1099,7 @@ If you are running one grep from a terminal, `rg` is still the right tool. If yo
 - `packages/fff-node` - Node.js SDK (`@ff-labs/fff-node`).
 - `packages/fff-bun` - Bun SDK (`@ff-labs/fff-bun`).
 - `packages/pi-fff` - pi extension (`@ff-labs/pi-fff`).
+- `go/` - Go bindings (`github.com/dmtrKovalenko/fff/go`).
 - `lua/` - Neovim-side plugin code.
 
 ## Contributing

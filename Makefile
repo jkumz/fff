@@ -16,7 +16,7 @@ SHELL := bash
 # string rather than the literal `-o` / `pipefail` tokens.
 .SHELLFLAGS := -o pipefail -euc
 
-.PHONY: build build-c-lib install uninstall test test-rust test-rescan test-rescan-known-defects rescan-probe test-c-smoke test-c-api test-lua test-lua-snap test-version test-bun test-node prepare-bun prepare-bun-packaged prepare-node set-npm-version header test-stress test-stress-seeded test-stress-random test-stress-regressions test-stress-repos test-node-stress sync-js-api sync-js-api-check bump-homebrew-formula bump-install-mcp-sh test-bun-compile bench-search bench-grep bench-definition
+.PHONY: build build-c-lib install uninstall test test-rust test-rescan test-rescan-known-defects rescan-probe test-c-smoke test-c-api go-pkgconfig test-go format-go lint-go test-lua test-lua-snap test-version test-bun test-node prepare-bun prepare-bun-packaged prepare-node set-npm-version header test-stress test-stress-seeded test-stress-random test-stress-regressions test-stress-repos test-node-stress sync-js-api sync-js-api-check bump-homebrew-formula bump-install-mcp-sh test-bun-compile bench-search bench-grep bench-definition
 
 all: format test lint
 
@@ -130,6 +130,18 @@ test-c-smoke: build-e2e
 
 # Alias kept for the `external-tests.yml` workflow naming.
 test-c-api: test-c-smoke
+
+# fff_c.pc for the Go package, pointing at this checkout's header and release build.
+GO_PKGCONFIG := $(TARGET_DIR)/go-pkgconfig
+GO_ENV := PKG_CONFIG_PATH="$(CURDIR)/$(GO_PKGCONFIG)$${PKG_CONFIG_PATH:+:$$PKG_CONFIG_PATH}"
+
+go-pkgconfig:
+	@mkdir -p $(GO_PKGCONFIG)
+	@printf 'Name: fff_c\nDescription: FFF C library from this checkout\nVersion: 0\nCflags: -I%s\nLibs: -L%s -lfff_c -Wl,-rpath,%s\n' \
+		"$(CURDIR)/$(SMOKE_INCLUDE)" "$(CURDIR)/$(TARGET_DIR)" "$(CURDIR)/$(TARGET_DIR)" > $(GO_PKGCONFIG)/fff_c.pc
+
+test-go: build-e2e go-pkgconfig
+	cd go && $(GO_ENV) go test -race -count=1 ./...
 
 # neovim instance swallows internal crashes and doesn't rise the the error exiting silently
 # so check the stdout in case the sigsegv coming out of fff was printed (actual regression).
@@ -283,6 +295,8 @@ format-lua:
 	stylua .
 format-ts:
 	cd packages && bun format
+format-go:
+	gofmt -w go
 
 format: format-rust format-lua format-ts
 
@@ -297,6 +311,10 @@ lint-lua:
 	$(LUACHECK) .
 lint-ts:
 	cd packages && bun lint
+lint-go: go-pkgconfig
+	@unformatted=$$(gofmt -l go); \
+	if [ -n "$$unformatted" ]; then echo "gofmt needed: $$unformatted" >&2; exit 1; fi
+	cd go && $(GO_ENV) go vet ./...
 
 lint: lint-rust lint-lua lint-ts
 
