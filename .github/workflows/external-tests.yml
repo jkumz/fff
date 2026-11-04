@@ -154,6 +154,52 @@ jobs:
         shell: bash
         run: make test-node
 
+  go-tests:
+    name: go (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ github.ref == 'refs/heads/main' && github.event_name == 'push' }}
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: sccache
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+          - os: macos-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1.15.4
+        with:
+          cache: true
+          cache-on-failure: false
+          cache-key: "v2-go-e2e"
+          rustflags: ""
+
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.11
+        with:
+          version: v0.17.0
+
+      - name: Install Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go/go.mod
+          cache: false
+
+      - name: Install pkg-config
+        if: runner.os == 'macOS'
+        run: command -v pkg-config || brew install pkgconf
+
+      - name: Run Go tests and vet
+        run: make test-go lint-go
+
   # Regression for https://github.com/dmtrKovalenko/fff/issues/480: build &
   # run @ff-labs/fff-node end-to-end on real Alpine Linux (musl). Forces
   # findBinary() through the npm-package resolver so detectLinuxLibc()
