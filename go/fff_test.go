@@ -494,6 +494,116 @@ func TestMultiGrepRejectsNoPatterns(t *testing.T) {
 	}
 }
 
+func TestMultiGrepOverlapping(t *testing.T) {
+	long := strings.Repeat("x", 600) + "FooBar"
+	inst := newInstance(t, Options{BasePath: writeTree(t, map[string]string{"a.go": "var FooBar = 1\n" + long + "\n"})})
+	waitForScan(t, inst)
+	q := MultiGrepQuery{Patterns: []string{"Foo", "FooBar"}}
+
+	// Off by default: non-overlapping hits only, no indexes, nothing past the 512-byte line cut.
+	page, err := inst.MultiGrep(q)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Matches) != 2 ||
+		!reflect.DeepEqual(page.Matches[0].Ranges, []MatchRange{{4, 7}}) || page.Matches[0].PatternIndexes != nil ||
+		len(page.Matches[1].Ranges) != 0 || page.Matches[1].PatternIndexes != nil {
+		t.Fatalf("default matches = %+v", page.Matches)
+	}
+
+	q.Overlapping = true
+	page, err = inst.MultiGrep(q)
+	if err != nil {
+		t.Fatal(err)
+	}
+	type got struct {
+		Col     uint32
+		Ranges  []MatchRange
+		Indexes []uint32
+	}
+	var gotMatches []got
+	for _, m := range page.Matches {
+		gotMatches = append(gotMatches, got{m.Col, m.Ranges, m.PatternIndexes})
+	}
+	want := []got{
+		{4, []MatchRange{{4, 7}, {4, 10}}, []uint32{0, 1}},
+		{600, []MatchRange{{600, 603}, {600, 606}}, []uint32{0, 1}},
+	}
+	if !reflect.DeepEqual(gotMatches, want) {
+		t.Fatalf("overlapping matches = %+v, want %+v", gotMatches, want)
+	}
+	if len(page.Matches[1].Line) != 512 {
+		t.Fatalf("Line holds %d bytes, want the 512-byte display cut", len(page.Matches[1].Line))
+	}
+}
+
+func TestMultiGrepOverlappingSlicesIndexesPerMatch(t *testing.T) {
+	inst := newInstance(t, Options{BasePath: writeTree(t, map[string]string{"a.txt": "Foo Bar\nFoo only\nBar only\n"})})
+	waitForScan(t, inst)
+	page, err := inst.MultiGrep(MultiGrepQuery{Patterns: []string{"Foo", "Bar"}, Overlapping: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got [][]uint32
+	for _, m := range page.Matches {
+		if len(m.PatternIndexes) != len(m.Ranges) {
+			t.Fatalf("line %d: %d indexes for %d ranges", m.LineNumber, len(m.PatternIndexes), len(m.Ranges))
+		}
+		got = append(got, m.PatternIndexes)
+	}
+	if want := [][]uint32{{0, 1}, {0}, {1}}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("PatternIndexes = %v, want %v", got, want)
+	}
+	// Each match gets its own slice, so appending to one cannot overwrite the next.
+	for _, m := range page.Matches {
+		if cap(m.PatternIndexes) != len(m.PatternIndexes) {
+			t.Fatalf("line %d: cap = %d, want %d", m.LineNumber, cap(m.PatternIndexes), len(m.PatternIndexes))
+		}
+	}
+}
+
+func TestMultiGrepOverlappingPages(t *testing.T) {
+	inst := newInstance(t, Options{BasePath: writeTree(t, map[string]string{
+		"a.txt": "Foo Bar\n",
+		"b.txt": "Bar\nFoo\n",
+		"c.txt": "Bar Foo Bar\n",
+		"d.txt": "Foo\n",
+	})})
+	waitForScan(t, inst)
+	q := MultiGrepQuery{Patterns: []string{"Foo", "Bar"}, Overlapping: true, GrepOptions: GrepOptions{PageLimit: 2}}
+	got := map[string][][]uint32{}
+	pages := 0
+	for {
+		page, err := inst.MultiGrep(q)
+		if err != nil {
+			t.Fatal(err)
+		}
+		pages++
+		for _, m := range page.Matches {
+			if len(m.PatternIndexes) != len(m.Ranges) {
+				t.Fatalf("%s:%d: %d indexes for %d ranges", m.Path, m.LineNumber, len(m.PatternIndexes), len(m.Ranges))
+			}
+			got[m.Path] = append(got[m.Path], m.PatternIndexes)
+		}
+		if page.NextFileOffset == 0 {
+			break
+		}
+		q.FileOffset = page.NextFileOffset
+	}
+	if pages < 2 {
+		t.Fatalf("%d page(s), want at least 2", pages)
+	}
+	want := map[string][][]uint32{
+		"a.txt": {{0, 1}},
+		"b.txt": {{1}, {0}},
+		"c.txt": {{1, 0, 1}},
+		"d.txt": {{0}},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("PatternIndexes = %v, want %v", got, want)
+	}
+}
+
 func TestScanState(t *testing.T) {
 	if err := fixture.ScanFiles(); err != nil {
 		t.Fatal(err)

@@ -78,6 +78,10 @@ func TestCallsFreeCMemory(t *testing.T) {
 			_, err := fixture.MultiGrep(MultiGrepQuery{Patterns: []string{"haystack", "needle"}, GrepOptions: GrepOptions{SmartCase: true}})
 			return err
 		}},
+		{"MultiGrepOverlapping", func() error {
+			_, err := fixture.MultiGrep(MultiGrepQuery{Patterns: []string{"need", "needle"}, Overlapping: true})
+			return err
+		}},
 		{"MultiGrepError", func() error {
 			if _, err := fixture.MultiGrep(MultiGrepQuery{}); err == nil {
 				t.Fatal("MultiGrep without patterns succeeded")
