@@ -432,7 +432,7 @@ fn grep_search_parsed<'a>(
     .build();
 
     let should_prefilter = regex.is_none();
-    let mut result = perform_grep(
+    let (mut result, _) = perform_grep(
         &mut files_to_search,
         options,
         &GrepContext {
@@ -468,7 +468,7 @@ fn grep_search_parsed<'a>(
                     if let Err(e) = searcher.search_slice(&regex_matcher, file_bytes, &mut sink) {
                         tracing::error!(error = %e, "Grep (regex) search failed");
                     }
-                    sink.state.matches
+                    (sink.state.matches, ())
                 }
                 None => {
                     let mut sink = PlainTextSink {
@@ -480,7 +480,7 @@ fn grep_search_parsed<'a>(
                     if let Err(e) = searcher.search_slice(&plain_matcher, file_bytes, &mut sink) {
                         tracing::error!(error = %e, "Grep (plain text) search failed");
                     }
-                    sink.state.matches
+                    (sink.state.matches, ())
                 }
             }
         },
@@ -582,14 +582,17 @@ impl GrepContext<'_, '_> {
     level = Level::DEBUG,
     fields(prefiltered_count = files_to_search.len())
 )]
-pub(super) fn perform_grep<'a, F>(
+// `search_file` returns a file's matches and a per-file payload `S`. The payloads of
+// the files kept in the result come back in `GrepResult::files` order.
+pub(super) fn perform_grep<'a, F, S>(
     files_to_search: &mut super::prefilter::RankedFiles<'a>,
     options: &GrepSearchOptions,
     ctx: &GrepContext<'_, '_>,
     search_file: F,
-) -> GrepResult<'a>
+) -> (GrepResult<'a>, Vec<S>)
 where
-    F: Fn(&FileItem, &[u8], usize) -> Vec<GrepMatch> + Sync,
+    F: Fn(&FileItem, &[u8], usize) -> (Vec<GrepMatch>, S) + Sync,
+    S: Send,
 {
     let time_budget = if options.time_budget_ms > 0 {
         Some(std::time::Duration::from_millis(options.time_budget_ms))
@@ -609,6 +612,7 @@ where
 
     let mut result_files: Vec<&'a FileItem> = Vec::new();
     let mut all_matches: Vec<GrepMatch> = Vec::new();
+    let mut payloads: Vec<S> = Vec::new();
     let mut files_consumed: usize = 0;
     let mut page_filled = false;
     let mut aborted = false;
@@ -634,7 +638,7 @@ where
         // Unless enforced, the budget stays dormant until something matched.
         let budget = time_budget.filter(|_| options.enforce_time_budget || all_matches.len() > 1);
 
-        let chunk_results: Vec<(usize, &'a FileItem, Vec<GrepMatch>)> = chunk
+        let chunk_results: Vec<(usize, &'a FileItem, Vec<GrepMatch>, S)> = chunk
             .par_iter()
             .enumerate()
             .map_init(
@@ -674,13 +678,14 @@ where
                         return None;
                     }
 
-                    let file_matches = search_file(file, content, options.max_matches_per_file);
+                    let (file_matches, payload) =
+                        search_file(file, content, options.max_matches_per_file);
 
                     if file_matches.is_empty() {
                         return None;
                     }
 
-                    Some((idx, *file, file_matches))
+                    Some((idx, *file, file_matches, payload))
                 },
             )
             .flatten()
@@ -697,7 +702,7 @@ where
         aborted = resume_at != usize::MAX;
         files_consumed = resume_at.min(chunk_offset + chunk.len());
 
-        for (batch_idx, file, file_matches) in chunk_results {
+        for (batch_idx, file, file_matches, payload) in chunk_results {
             // Matches past the abort point are dropped; the next page re-searches them.
             if batch_idx >= resume_at {
                 continue;
@@ -705,6 +710,7 @@ where
 
             let file_result_idx = result_files.len();
             result_files.push(file);
+            payloads.push(payload);
 
             for mut m in file_matches {
                 m.file_index = file_result_idx;
@@ -741,7 +747,7 @@ where
         0
     };
 
-    GrepResult {
+    let result = GrepResult {
         matches: all_matches,
         files_with_matches: result_files.len(),
         files: result_files,
@@ -751,7 +757,8 @@ where
         next_file_offset,
         regex_fallback_error: None,
         literal_fallback: false,
-    }
+    };
+    (result, payloads)
 }
 
 #[cfg(test)]

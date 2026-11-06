@@ -125,6 +125,10 @@ pub enum Error {
 
     #[error("Failed to start watch callback dispatcher: {0}")]
     WatchDispatcherStart(#[source] std::io::Error),
+
+    // An empty pattern would match at every byte of every line.
+    #[error("Overlapping multi-pattern grep does not accept an empty pattern")]
+    EmptyOverlappingPattern,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

@@ -586,7 +586,7 @@ fn test_multi_grep_search() {
     let no_cancel = AtomicBool::new(false);
 
     // Test with 3 patterns
-    let result = super::multi_grep_search(
+    let result = super::multi_grep_search_with(
         files,
         &["GrepMode", "GrepMatch", "PlainTextMatcher"],
         &[],
@@ -598,7 +598,10 @@ fn test_multi_grep_search() {
         dir.path(),
         arena,
         arena,
-    );
+        false,
+    )
+    .unwrap()
+    .0;
 
     assert!(
         result.matches.len() >= 3,
@@ -626,7 +629,7 @@ fn test_multi_grep_search() {
     assert_eq!(result.files.len(), 2, "Should match exactly 2 files");
 
     // Test with single pattern
-    let result2 = super::multi_grep_search(
+    let result2 = super::multi_grep_search_with(
         files,
         &["PlainTextMatcher"],
         &[],
@@ -638,7 +641,10 @@ fn test_multi_grep_search() {
         dir.path(),
         arena,
         arena,
-    );
+        false,
+    )
+    .unwrap()
+    .0;
     assert_eq!(
         result2.matches.len(),
         1,
@@ -646,7 +652,7 @@ fn test_multi_grep_search() {
     );
 
     // Test with empty patterns
-    let result3 = super::multi_grep_search(
+    let result3 = super::multi_grep_search_with(
         files,
         &[],
         &[],
@@ -658,7 +664,10 @@ fn test_multi_grep_search() {
         dir.path(),
         arena,
         arena,
-    );
+        false,
+    )
+    .unwrap()
+    .0;
     assert_eq!(
         result3.matches.len(),
         0,
@@ -1020,4 +1029,336 @@ fn multi_grep_keeps_files_for_a_pattern_without_bigrams() {
     let (paths, searched) = grep(&["unicorn"]);
     assert_eq!(paths, vec!["a.txt", "b.txt", "c.txt"]);
     assert_eq!(searched, 3);
+}
+
+fn overlapping_picker(files: &[(&str, &str)]) -> (tempfile::TempDir, FilePicker) {
+    let dir = tempfile::tempdir().unwrap();
+    let base = crate::path_utils::canonicalize(dir.path()).unwrap();
+    for (name, content) in files {
+        std::fs::write(base.join(name), content).unwrap();
+    }
+    let mut picker = FilePicker::new(FilePickerOptions {
+        base_path: base.to_str().unwrap().into(),
+        watch: false,
+        ..Default::default()
+    })
+    .unwrap();
+    picker.collect_files().unwrap();
+    (dir, picker)
+}
+
+fn overlapping_options() -> crate::GrepSearchOptions {
+    crate::GrepSearchOptions {
+        smart_case: false,
+        max_matches_per_file: 0,
+        page_limit: 100,
+        ..Default::default()
+    }
+}
+
+// (line_number, col, ranges, pattern indexes) of every match.
+type OverlapHit = (u64, usize, Vec<(u32, u32)>, Vec<u32>);
+
+fn overlapping_hits(result: &crate::OverlappingGrepResult<'_>) -> Vec<OverlapHit> {
+    let matches = &result.result().matches;
+    (0..matches.len())
+        .map(|i| {
+            let m = &matches[i];
+            let ranges = m.match_byte_offsets.to_vec();
+            (
+                m.line_number,
+                m.col,
+                ranges,
+                result.match_pattern_indexes(i).to_vec(),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn multi_grep_overlapping_reports_every_pattern_at_a_position() {
+    let long_line = format!("{}FooBar", "x".repeat(600));
+    let content = format!("let FooBar = 1;\n{long_line}\n");
+    let (_dir, picker) = overlapping_picker(&[("a.rs", &content)]);
+    let options = overlapping_options();
+    let patterns = ["Foo", "FooBar"];
+
+    // Default mode keeps non-overlapping earliest-ending hits within the first 512 bytes.
+    let result = picker.multi_grep(&patterns, &[], &options);
+    assert_eq!(result.matches.len(), 2);
+    assert_eq!(result.matches[0].match_byte_offsets.as_slice(), &[(4, 7)]);
+    assert!(result.matches[1].match_byte_offsets.is_empty());
+
+    let result = picker
+        .multi_grep_overlapping(&patterns, &[], &options)
+        .unwrap();
+    assert_eq!(
+        overlapping_hits(&result),
+        vec![
+            (1, 4, vec![(4, 7), (4, 10)], vec![0, 1]),
+            (2, 600, vec![(600, 603), (600, 606)], vec![0, 1]),
+        ]
+    );
+    // Ranges past the 512-byte display cut stay on the full line.
+    assert_eq!(result.result().matches[1].line_content.len(), 512);
+}
+
+#[test]
+fn multi_grep_overlapping_col_is_the_smallest_start() {
+    let (_dir, picker) = overlapping_picker(&[("a.txt", "FooBarBaz\n")]);
+    let result = picker
+        .multi_grep_overlapping(&["FooBarBaz", "Bar"], &[], &overlapping_options())
+        .unwrap();
+    // Bar ends first, so it comes first; col still points at FooBarBaz.
+    assert_eq!(
+        overlapping_hits(&result),
+        vec![(1, 0, vec![(3, 6), (0, 9)], vec![1, 0])]
+    );
+}
+
+#[test]
+fn multi_grep_overlapping_reports_a_pattern_overlapping_itself() {
+    let (_dir, picker) = overlapping_picker(&[("a.txt", "aaaa\n")]);
+    let result = picker
+        .multi_grep_overlapping(&["aa"], &[], &overlapping_options())
+        .unwrap();
+    assert_eq!(
+        overlapping_hits(&result),
+        vec![(1, 0, vec![(0, 2), (1, 3), (2, 4)], vec![0, 0, 0])]
+    );
+}
+
+#[test]
+fn multi_grep_overlapping_slices_indexes_per_line() {
+    let (_dir, picker) = overlapping_picker(&[("a.txt", "Foo Bar\nFoo only\n")]);
+    let result = picker
+        .multi_grep_overlapping(&["Foo", "Bar"], &[], &overlapping_options())
+        .unwrap();
+    assert_eq!(
+        overlapping_hits(&result),
+        vec![
+            (1, 0, vec![(0, 3), (4, 7)], vec![0, 1]),
+            (2, 0, vec![(0, 3)], vec![0]),
+        ]
+    );
+}
+
+#[test]
+fn multi_grep_overlapping_trims_against_the_full_line() {
+    let deep = format!("{}FooBar", " ".repeat(600));
+    let content = format!("    let FooBar = 1;\n{deep}\n");
+    let (_dir, picker) = overlapping_picker(&[("a.rs", &content)]);
+    let options = crate::GrepSearchOptions {
+        trim_whitespace: true,
+        ..overlapping_options()
+    };
+    let result = picker
+        .multi_grep_overlapping(&["Foo", "FooBar"], &[], &options)
+        .unwrap();
+    assert_eq!(
+        overlapping_hits(&result),
+        vec![
+            (1, 4, vec![(4, 7), (4, 10)], vec![0, 1]),
+            (2, 0, vec![(0, 3), (0, 6)], vec![0, 1]),
+        ]
+    );
+    assert_eq!(result.result().matches[0].line_content, "let FooBar = 1;");
+    // The display cut holds only indentation, so nothing of the line is left.
+    assert_eq!(result.result().matches[1].line_content, "");
+}
+
+#[test]
+fn multi_grep_overlapping_follows_smart_case() {
+    let (_dir, picker) = overlapping_picker(&[("a.txt", "FooBar foobar\n")]);
+    let options = crate::GrepSearchOptions {
+        smart_case: true,
+        ..overlapping_options()
+    };
+    // An uppercase pattern makes the whole search case-sensitive.
+    let result = picker
+        .multi_grep_overlapping(&["Foo", "foobar"], &[], &options)
+        .unwrap();
+    assert_eq!(
+        overlapping_hits(&result),
+        vec![(1, 0, vec![(0, 3), (7, 13)], vec![0, 1])]
+    );
+    // All-lowercase patterns match either case.
+    let result = picker
+        .multi_grep_overlapping(&["foo", "foobar"], &[], &options)
+        .unwrap();
+    assert_eq!(
+        overlapping_hits(&result),
+        vec![(
+            1,
+            0,
+            vec![(0, 3), (0, 6), (7, 10), (7, 13)],
+            vec![0, 1, 0, 1]
+        )]
+    );
+}
+
+#[test]
+fn multi_grep_overlapping_classifies_definitions() {
+    let (_dir, picker) = overlapping_picker(&[("a.rs", "fn foo_bar() {}\nfoo_bar();\n")]);
+    let patterns = ["foo", "foo_bar"];
+    let classify = crate::GrepSearchOptions {
+        classify_definitions: DefinitionMode::Classify,
+        ..overlapping_options()
+    };
+    let result = picker
+        .multi_grep_overlapping(&patterns, &[], &classify)
+        .unwrap();
+    let definitions: Vec<bool> = result
+        .result()
+        .matches
+        .iter()
+        .map(|m| m.is_definition)
+        .collect();
+    assert_eq!(definitions, vec![true, false]);
+    assert_eq!(result.match_pattern_indexes(0), &[0, 1]);
+
+    let definition_only = crate::GrepSearchOptions {
+        classify_definitions: DefinitionMode::DefinitionOnly,
+        ..overlapping_options()
+    };
+    let result = picker
+        .multi_grep_overlapping(&patterns, &[], &definition_only)
+        .unwrap();
+    assert_eq!(
+        overlapping_hits(&result),
+        vec![(1, 3, vec![(3, 6), (3, 10)], vec![0, 1])]
+    );
+}
+
+#[test]
+fn multi_grep_overlapping_rejects_an_empty_pattern() {
+    let (_dir, picker) = overlapping_picker(&[("a.txt", "Foo\n")]);
+    let options = overlapping_options();
+    for patterns in [&["Foo", ""][..], &[""], &["", "absent"]] {
+        let err = picker
+            .multi_grep_overlapping(patterns, &[], &options)
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::Error::EmptyOverlappingPattern),
+            "{patterns:?}: {err}"
+        );
+    }
+    // A pattern no file holds leaves nothing to search, which is not an error.
+    let result = picker
+        .multi_grep_overlapping(&["absent"], &[], &options)
+        .unwrap();
+    assert!(result.result().matches.is_empty());
+    assert!(result.pattern_indexes().is_empty());
+}
+
+#[test]
+fn multi_grep_overlapping_pages_keep_indexes_per_match() {
+    let (_dir, picker) = overlapping_picker(&[
+        ("a.txt", "Foo Bar\n"),
+        ("b.txt", "Bar\nFoo\n"),
+        ("c.txt", "Bar Foo Bar\n"),
+        ("d.txt", "Foo\n"),
+    ]);
+    let mut options = crate::GrepSearchOptions {
+        page_limit: 2,
+        ..overlapping_options()
+    };
+    let mut got: Vec<(String, Vec<u32>)> = Vec::new();
+    let mut pages = 0;
+    loop {
+        let page = picker
+            .multi_grep_overlapping(&["Foo", "Bar"], &[], &options)
+            .unwrap();
+        pages += 1;
+        let result = page.result();
+        let ranges: usize = result
+            .matches
+            .iter()
+            .map(|m| m.match_byte_offsets.len())
+            .sum();
+        assert_eq!(page.pattern_indexes().len(), ranges);
+        for (i, m) in result.matches.iter().enumerate() {
+            let indexes = page.match_pattern_indexes(i);
+            assert_eq!(indexes.len(), m.match_byte_offsets.len());
+            got.push((
+                result.files[m.file_index].relative_path(&picker),
+                indexes.to_vec(),
+            ));
+        }
+        if result.next_file_offset == 0 {
+            break;
+        }
+        options.file_offset = result.next_file_offset;
+    }
+    assert!(pages >= 2, "{pages} page(s)");
+    got.sort();
+    let want: Vec<(String, Vec<u32>)> = [
+        ("a.txt", vec![0, 1]),
+        ("b.txt", vec![0]),
+        ("b.txt", vec![1]),
+        ("c.txt", vec![1, 0, 1]),
+        ("d.txt", vec![0]),
+    ]
+    .into_iter()
+    .map(|(p, i)| (p.to_string(), i))
+    .collect();
+    assert_eq!(got, want);
+}
+
+#[test]
+fn multi_grep_overlapping_usage_only_skips_a_leading_definition() {
+    let content = "fn foo_bar() {}\nfoo_bar();\nfoo_bar();\n";
+    let (_dir, picker) = overlapping_picker(&[("a.rs", content)]);
+    let options = crate::GrepSearchOptions {
+        classify_definitions: DefinitionMode::UsageOnly,
+        max_matches_per_file: 1,
+        before_context: 1,
+        after_context: 1,
+        ..overlapping_options()
+    };
+    let result = picker
+        .multi_grep_overlapping(&["foo", "foo_bar"], &[], &options)
+        .unwrap();
+    // The dropped definition leaves no indexes behind, and the cap stops after line 2.
+    assert_eq!(
+        overlapping_hits(&result),
+        vec![(2, 0, vec![(0, 3), (0, 7)], vec![0, 1])]
+    );
+    assert_eq!(result.pattern_indexes(), &[0, 1]);
+    let m = &result.result().matches[0];
+    assert!(!m.is_definition);
+    assert_eq!(m.context_before, vec!["fn foo_bar() {}"]);
+    assert_eq!(m.context_after, vec!["foo_bar();"]);
+}
+
+#[test]
+fn multi_grep_overlapping_matches_patterns_literally() {
+    let (_dir, picker) = overlapping_picker(&[("a.txt", "x a.b( y\nab(\n")]);
+    let result = picker
+        .multi_grep_overlapping(&["a.b(", "b"], &[], &overlapping_options())
+        .unwrap();
+    assert_eq!(
+        overlapping_hits(&result),
+        vec![
+            (1, 2, vec![(4, 5), (2, 6)], vec![1, 0]),
+            (2, 1, vec![(1, 2)], vec![1]),
+        ]
+    );
+}
+
+#[test]
+fn multi_grep_overlapping_trims_unicode_whitespace() {
+    let (_dir, picker) = overlapping_picker(&[("a.txt", "\u{a0}\u{a0}FooBar\n")]);
+    let options = crate::GrepSearchOptions {
+        trim_whitespace: true,
+        ..overlapping_options()
+    };
+    let result = picker
+        .multi_grep_overlapping(&["Foo", "FooBar"], &[], &options)
+        .unwrap();
+    assert_eq!(
+        overlapping_hits(&result),
+        vec![(1, 0, vec![(0, 3), (0, 6)], vec![0, 1])]
+    );
+    assert_eq!(result.result().matches[0].line_content, "FooBar");
 }

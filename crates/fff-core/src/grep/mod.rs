@@ -10,6 +10,7 @@ pub use grep::*;
 mod definition_mode;
 mod fuzzy_grep;
 mod multi_pattern;
+mod overlapping;
 mod prefilter;
 mod regex;
 mod sink;
@@ -21,7 +22,8 @@ mod classify;
 pub use classify::*;
 
 pub use definition_mode::DefinitionMode;
-pub(crate) use multi_pattern::multi_grep_search;
+pub(crate) use multi_pattern::multi_grep_search_with;
+pub use overlapping::OverlappingGrepResult;
 pub use regex::has_regex_metacharacters;
 pub use types::*;
 

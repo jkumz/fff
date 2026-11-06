@@ -1,10 +1,12 @@
 use super::grep::{GrepContext, perform_grep};
+use super::overlapping::OverlappingSink;
 use super::prefilter::prefilter_files;
 use super::sink::{SinkState, debug_assert_newline_terminator, strip_line_terminators};
 use super::types::{GrepResult, GrepSearchOptions};
+use crate::error::Error;
 use crate::index::{BigramFilter, BigramOverlay, bigram_boundary, literal_candidates};
 use crate::types::{ContentCacheBudget, FileItem, FileSliceExt};
-use aho_corasick::AhoCorasick;
+use aho_corasick::{AhoCorasick, MatchKind};
 use fff_grep::{
     Searcher, SearcherBuilder, Sink, SinkMatch,
     matcher::{Match, Matcher, NoError},
@@ -101,9 +103,14 @@ impl Sink for AhoCorasickSink<'_> {
 /// pass. This is significantly faster than regex alternation for literal text
 /// searches because Aho-Corasick uses SIMD-accelerated multi-needle matching.
 ///
-/// Returns the same `GrepResult` type as `grep_search`.
+/// Returns the same `GrepResult` type as `grep_search`. With `overlapping`, every
+/// pattern hit is reported over the full line, and the second value holds each
+/// range's pattern index in match order; otherwise it is empty.
+///
+/// Fails with [`Error::EmptyOverlappingPattern`] when `overlapping` and any pattern
+/// is empty; the default mode never fails.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn multi_grep_search<'a>(
+pub(crate) fn multi_grep_search_with<'a>(
     files: &'a [FileItem],
     patterns: &[&str],
     constraints: &[fff_query_parser::Constraint<'_>],
@@ -115,11 +122,15 @@ pub(crate) fn multi_grep_search<'a>(
     base_path: &Path,
     arena: crate::simd_path::ArenaPtr,
     overflow_arena: crate::simd_path::ArenaPtr,
-) -> GrepResult<'a> {
+    overlapping: bool,
+) -> Result<(GrepResult<'a>, Vec<u32>), Error> {
+    if overlapping && patterns.iter().any(|p| p.is_empty()) {
+        return Err(Error::EmptyOverlappingPattern);
+    }
     let total_files = files.live_count();
 
     if patterns.is_empty() || patterns.iter().all(|p| p.is_empty()) {
-        return GrepResult::empty(total_files, total_files);
+        return Ok((GrepResult::empty(total_files, total_files), Vec::new()));
     }
 
     let bigram_candidates = literal_candidates(bigram_index, bigram_overlay, patterns);
@@ -137,13 +148,18 @@ pub(crate) fn multi_grep_search<'a>(
     );
 
     if files_to_search.is_empty() {
-        return GrepResult::empty(total_files, filtered_file_count);
+        return Ok((
+            GrepResult::empty(total_files, filtered_file_count),
+            Vec::new(),
+        ));
     }
 
     let casing = options.effective_casing();
     let case_insensitive = patterns.iter().all(|p| casing.is_insensitive_for(p));
 
+    // Standard is the only match kind `find_overlapping_iter` accepts.
     let ac = aho_corasick::AhoCorasickBuilder::new()
+        .match_kind(MatchKind::Standard)
         .ascii_case_insensitive(case_insensitive)
         .build(patterns)
         .expect("Aho-Corasick build should not fail for literal patterns");
@@ -156,37 +172,78 @@ pub(crate) fn multi_grep_search<'a>(
     .build();
 
     let ac_matcher = AhoCorasickMatcher { ac: &ac };
-    perform_grep(
+    let ctx = GrepContext {
+        total_files,
+        filtered_file_count,
+        budget,
+        base_path,
+        arena,
+        overflow_arena,
+        prefilter: None, // no memmem prefilter for multi-pattern search
+        abort_signal,
+    };
+    if overlapping {
+        let (result, per_file) = perform_grep(
+            &mut files_to_search,
+            options,
+            &ctx,
+            |file: &FileItem, file_bytes: &[u8], max_matches: usize| {
+                let mut sink = OverlappingSink {
+                    state: sink_state(file, options, max_matches),
+                    ac: &ac,
+                    trim_whitespace: options.trim_whitespace,
+                    pattern_indexes: Vec::new(),
+                };
+                if let Err(e) = searcher.search_slice(&ac_matcher, file_bytes, &mut sink) {
+                    tracing::error!(error = %e, "Grep (aho-corasick overlapping) search failed");
+                }
+                (sink.state.matches, sink.pattern_indexes)
+            },
+        );
+        // The sink already trimmed, so the trim in perform_grep finds nothing left to strip.
+        return Ok((result, flatten(per_file)));
+    }
+
+    let (result, _) = perform_grep(
         &mut files_to_search,
         options,
-        &GrepContext {
-            total_files,
-            filtered_file_count,
-            budget,
-            base_path,
-            arena,
-            overflow_arena,
-            prefilter: None, // no memmem prefilter for multi-pattern search
-            abort_signal,
-        },
+        &ctx,
         |file: &FileItem, file_bytes: &[u8], max_matches: usize| {
-            let state = SinkState {
-                file,
-                definition_mode: options.classify_definitions,
-                file_index: 0,
-                matches: Vec::with_capacity(4),
-                max_matches,
-                before_context: options.before_context,
-                after_context: options.after_context,
+            let mut sink = AhoCorasickSink {
+                state: sink_state(file, options, max_matches),
+                ac: &ac,
             };
-
-            let mut sink = AhoCorasickSink { state, ac: &ac };
-
             if let Err(e) = searcher.search_slice(&ac_matcher, file_bytes, &mut sink) {
                 tracing::error!(error = %e, "Grep (aho-corasick multi) search failed");
             }
-
-            sink.state.matches
+            (sink.state.matches, ())
         },
-    )
+    );
+    Ok((result, Vec::new()))
+}
+
+fn sink_state<'f>(file: &'f FileItem, options: &GrepSearchOptions, max: usize) -> SinkState<'f> {
+    SinkState {
+        file,
+        definition_mode: options.classify_definitions,
+        file_index: 0,
+        matches: Vec::with_capacity(4),
+        max_matches: max,
+        before_context: options.before_context,
+        after_context: options.after_context,
+    }
+}
+
+// Joins the per-file index vectors, growing the first one instead of allocating a new one.
+fn flatten(per_file: Vec<Vec<u32>>) -> Vec<u32> {
+    let total: usize = per_file.iter().map(Vec::len).sum();
+    let mut files = per_file.into_iter();
+    let Some(mut all) = files.next() else {
+        return Vec::new();
+    };
+    all.reserve_exact(total - all.len());
+    for indexes in files {
+        all.extend(indexes);
+    }
+    all
 }
