@@ -28,20 +28,21 @@
  *
  * Depending on the function, the payload is delivered through different fields:
  *
- * | Function                   | Payload field | Type                          |
- * |----------------------------|---------------|-------------------------------|
- * | `fff_create_instance`      | `handle`      | opaque instance pointer       |
- * | `fff_search`               | `handle`      | `*mut FffSearchResult`        |
- * | `fff_live_grep`            | `handle`      | `*mut FffGrepResult`          |
- * | `fff_multi_grep`           | `handle`      | `*mut FffGrepResult`          |
- * | `fff_get_scan_progress`    | `handle`      | `*mut FffScanProgress`        |
- * | `fff_health_check`         | `handle`      | `*mut c_char` (JSON string)   |
- * | `fff_get_historical_query` | `handle`      | `*mut c_char` (string or null)|
- * | `fff_wait_for_scan`        | `int_value`   | 1 = completed, 0 = timed out  |
- * | `fff_track_query`          | `int_value`   | 1 = success, 0 = failure      |
- * | `fff_refresh_git_status`   | `int_value`   | number of files updated       |
- * | `fff_scan_files`           | (none)        | success flag only             |
- * | `fff_restart_index`        | (none)        | success flag only             |
+ * | Function                     | Payload field | Type                           |
+ * |------------------------------|---------------|--------------------------------|
+ * | `fff_create_instance`        | `handle`      | opaque instance pointer        |
+ * | `fff_search`                 | `handle`      | `*mut FffSearchResult`         |
+ * | `fff_live_grep`              | `handle`      | `*mut FffGrepResult`           |
+ * | `fff_multi_grep`             | `handle`      | `*mut FffGrepResult`           |
+ * | `fff_multi_grep_overlapping` | `handle`      | `*mut FffGrepResult`           |
+ * | `fff_get_scan_progress`      | `handle`      | `*mut FffScanProgress`         |
+ * | `fff_health_check`           | `handle`      | `*mut c_char` (JSON string)    |
+ * | `fff_get_historical_query`   | `handle`      | `*mut c_char` (string or null) |
+ * | `fff_wait_for_scan`          | `int_value`   | 1 = completed, 0 = timed out   |
+ * | `fff_track_query`            | `int_value`   | 1 = success, 0 = failure       |
+ * | `fff_refresh_git_status`     | `int_value`   | number of files updated        |
+ * | `fff_scan_files`             | (none)        | success flag only              |
+ * | `fff_restart_index`          | (none)        | success flag only              |
  *
  * On failure, `success` is false and `error` contains the message.
  */
@@ -218,7 +219,8 @@ typedef struct FffSearchResult {
 } FffSearchResult;
 
 /**
- * A byte range within a matched line, used for highlighting.
+ * A byte range within a matched line, used for highlighting. `fff_multi_grep_overlapping`
+ * measures it on the full line, so it can lie past the end of `line_content`.
  */
 typedef struct FffMatchRange {
   uint32_t start;
@@ -255,8 +257,8 @@ typedef struct FffGrepMatch {
 } FffGrepMatch;
 
 /**
- * Grep result returned by `fff_live_grep` and `fff_multi_grep`;
- * free with `fff_free_grep_result`.
+ * Grep result returned by `fff_live_grep`, `fff_multi_grep` and
+ * `fff_multi_grep_overlapping`; free with `fff_free_grep_result`.
  */
 typedef struct FffGrepResult {
   /**
@@ -291,6 +293,15 @@ typedef struct FffGrepResult {
    * Regex compilation error when falling back to literal matching. Null if none.
    */
   char *regex_fallback_error;
+  /**
+   * Pattern index of every match range, in `items` order then range order.
+   * Set by `fff_multi_grep_overlapping` only; null otherwise.
+   */
+  uint32_t *match_pattern_indexes;
+  /**
+   * Number of entries in `match_pattern_indexes`.
+   */
+  uint32_t match_pattern_indexes_count;
 } FffGrepResult;
 
 /**
@@ -715,6 +726,30 @@ struct FffResult *fff_multi_grep_ex(void *fff_handle,
                                     uint8_t classify_definitions);
 
 /**
+ * [`fff_multi_grep_ex`] reporting every hit, overlapping ones too (`aa` 3 times on `aaaa`).
+ * Ranges and `col` cover the full line, in end-offset order, and are not capped.
+ *
+ * `match_pattern_indexes` holds each range's index in `patterns_joined`, which must
+ * not contain an empty pattern.
+ *
+ * ## Safety
+ * Same as [`fff_multi_grep`].
+ */
+struct FffResult *fff_multi_grep_overlapping(void *fff_handle,
+                                             const char *patterns_joined,
+                                             const char *constraints,
+                                             uint64_t max_file_size,
+                                             uint32_t max_matches_per_file,
+                                             bool smart_case,
+                                             uint32_t file_offset,
+                                             uint32_t page_limit,
+                                             uint64_t time_budget_ms,
+                                             bool enforce_time_budget,
+                                             uint32_t before_context,
+                                             uint32_t after_context,
+                                             uint8_t classify_definitions);
+
+/**
  * Trigger a rescan of the file index.
  *
  * ## Safety
@@ -838,12 +873,12 @@ const struct FffScore *fff_search_result_get_score(const struct FffSearchResult 
                                                    uint32_t index);
 
 /**
- * Free a grep result returned by `fff_live_grep` or `fff_multi_grep`:
- * the struct, its `items` array, and all strings/ranges/context within.
+ * Free a grep result from `fff_live_grep`, `fff_multi_grep` or `fff_multi_grep_overlapping`:
+ * the struct, its `items` array, pattern indexes, and all strings/ranges/context within.
  *
  * ## Safety
- * `result` must be a valid pointer previously returned via `FffResult.handle`
- * from `fff_live_grep` or `fff_multi_grep`, or null (no-op).
+ * `result` must be a valid pointer previously returned via `FffResult.handle` from
+ * `fff_live_grep`, `fff_multi_grep` or `fff_multi_grep_overlapping`, or null (no-op).
  */
 void fff_free_grep_result(struct FffGrepResult *result);
 
@@ -852,7 +887,8 @@ void fff_free_grep_result(struct FffGrepResult *result);
  * `index >= count`. Valid until the grep result is freed.
  *
  * ## Safety
- * `result` must be a valid `FffGrepResult` pointer from `fff_live_grep` or `fff_multi_grep`.
+ * `result` must be a valid `FffGrepResult` pointer from `fff_live_grep`, `fff_multi_grep`
+ * or `fff_multi_grep_overlapping`.
  */
 const struct FffGrepMatch *fff_grep_result_get_match(const struct FffGrepResult *result,
                                                      uint32_t index);
@@ -1392,8 +1428,28 @@ uint32_t fff_grep_result_get_total_files(const struct FffGrepResult *r);
 uint32_t fff_grep_result_get_filtered_file_count(const struct FffGrepResult *r);
 
 /**
+ * Number of entries in `match_pattern_indexes`, one per match range of an overlapping
+ * multi-pattern grep; `0` for other greps or if `r` is null.
+ *
+ * ## Safety
+ * `r` must be a valid `FffGrepResult` pointer or null.
+ */
+uint32_t fff_grep_result_get_match_pattern_indexes_count(const struct FffGrepResult *r);
+
+/**
+ * Pointer to the `index`-th pattern index, in match then range order; null if `r` is null
+ * or `index >= match_pattern_indexes_count`. Valid until the result is freed; do not free.
+ *
+ * ## Safety
+ * `r` must be a valid `FffGrepResult` pointer or null.
+ */
+const uint32_t *fff_grep_result_get_match_pattern_index(const struct FffGrepResult *r,
+                                                        uint32_t index);
+
+/**
  * File offset for the next page; `0` if all files have been searched or `r` is null.
- * Pass as `file_offset` to a subsequent `fff_live_grep`/`fff_multi_grep` call to continue pagination.
+ * Pass as `file_offset` to the next `fff_live_grep`, `fff_multi_grep` or
+ * `fff_multi_grep_overlapping` call to continue pagination.
  *
  * ## Safety
  * `r` must be a valid `FffGrepResult` pointer or null.
