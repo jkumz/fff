@@ -238,6 +238,65 @@ static int watch_smoke(void) {
     return 0;
 }
 
+// Overlapping multi-grep over this file: one pattern index per range, nested hits that
+// share a start, more ranges than fff_multi_grep_ex, and no empty pattern.
+static int overlap_smoke(void *file_picker) {
+    struct FffResult *res = fff_multi_grep_ex(file_picker, "overlap\noverlap_smoke", "smoke.c", 0, 0,
+                                              false, 0, 0, 0, false, 0, 0, 0);
+    if (!res->success) {
+        fprintf(stderr, "multi grep failed: %s\n", res->error ? res->error : "?");
+        fff_free_result(res);
+        return 1;
+    }
+    struct FffGrepResult *gr = (struct FffGrepResult *)res->handle;
+    uint32_t default_ranges = 0;
+    for (uint32_t i = 0; i < gr->count; i++) {
+        default_ranges += gr->items[i].match_ranges_count;
+    }
+    fff_free_grep_result(gr);
+    fff_free_result(res);
+
+    res = fff_multi_grep_overlapping(file_picker, "overlap\noverlap_smoke", "smoke.c", 0, 0, false,
+                                     0, 0, 0, false, 0, 0, 0);
+    if (!res->success) {
+        fprintf(stderr, "overlapping grep failed: %s\n", res->error ? res->error : "?");
+        fff_free_result(res);
+        return 1;
+    }
+    gr = (struct FffGrepResult *)res->handle;
+    uint32_t ranges = 0, shared_start = 0;
+    for (uint32_t i = 0; i < gr->count; i++) {
+        const struct FffGrepMatch *m = &gr->items[i];
+        for (uint32_t a = 0; a < m->match_ranges_count; a++) {
+            for (uint32_t b = 0; b < m->match_ranges_count; b++) {
+                shared_start += *fff_grep_result_get_match_pattern_index(gr, ranges + a) == 0 &&
+                                *fff_grep_result_get_match_pattern_index(gr, ranges + b) == 1 &&
+                                m->match_ranges[a].start == m->match_ranges[b].start;
+            }
+        }
+        ranges += m->match_ranges_count;
+    }
+    int ok = gr->count > 0 && fff_grep_result_get_match_pattern_indexes_count(gr) == ranges &&
+             shared_start > 0 && ranges > default_ranges;
+    fff_free_grep_result(gr);
+    fff_free_result(res);
+    if (!ok) {
+        fprintf(stderr, "overlapping grep: %u ranges (default %u), %u shared starts\n", ranges,
+                default_ranges, shared_start);
+        return 1;
+    }
+
+    res = fff_multi_grep_overlapping(file_picker, "overlap\n\nsmoke", NULL, 0, 0, false, 0, 0, 0,
+                                     false, 0, 0, 0);
+    int rejected = !res->success;
+    fff_free_result(res);
+    if (!rejected) {
+        fprintf(stderr, "overlapping grep accepted an empty pattern\n");
+        return 1;
+    }
+    return 0;
+}
+
 int main(int argc, char **argv) {
     const char *base_path = argc > 1 ? argv[1] : ".";
 
@@ -299,7 +358,12 @@ int main(int argc, char **argv) {
 
     fff_free_search_result(sr);
     fff_free_result(res);
+    int overlap_failed = overlap_smoke(file_picker);
     fff_destroy(file_picker);
+    if (overlap_failed) {
+        fprintf(stderr, "FAIL: overlapping grep test failed\n");
+        return 1;
+    }
 
     if (!found) {
         fprintf(stderr, "FAIL: smoke.c not in search results (count=%u)\n", total);

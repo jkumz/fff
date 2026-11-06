@@ -8,7 +8,7 @@ use fff::file_picker::FilePicker;
 use fff::git::format_git_status;
 use fff::{
     DirItem, DirSearchResult, FileItem, GrepMatch, GrepResult, Location, MixedItemRef,
-    MixedSearchResult, Score, SearchResult,
+    MixedSearchResult, OverlappingGrepResult, Score, SearchResult,
 };
 
 /// Current used version of [`FffCreateOptions`].
@@ -316,7 +316,8 @@ impl FffSearchResult {
 // Grep result types
 // ---------------------------------------------------------------------------
 
-/// A byte range within a matched line, used for highlighting.
+/// A byte range within a matched line, used for highlighting. `fff_multi_grep_overlapping`
+/// measures it on the full line, so it can lie past the end of `line_content`.
 #[repr(C)]
 pub struct FffMatchRange {
     pub start: u32,
@@ -426,8 +427,8 @@ impl FffGrepMatch {
     }
 }
 
-/// Grep result returned by `fff_live_grep` and `fff_multi_grep`;
-/// free with `fff_free_grep_result`.
+/// Grep result returned by `fff_live_grep`, `fff_multi_grep` and
+/// `fff_multi_grep_overlapping`; free with `fff_free_grep_result`.
 #[repr(C)]
 pub struct FffGrepResult {
     /// Heap array of `FffGrepMatch` (length = `count`).
@@ -446,11 +447,30 @@ pub struct FffGrepResult {
     pub next_file_offset: u32,
     /// Regex compilation error when falling back to literal matching. Null if none.
     pub regex_fallback_error: *mut c_char,
+    /// Pattern index of every match range, in `items` order then range order.
+    /// Set by `fff_multi_grep_overlapping` only; null otherwise.
+    pub match_pattern_indexes: *mut u32,
+    /// Number of entries in `match_pattern_indexes`.
+    pub match_pattern_indexes_count: u32,
 }
 
 impl FffGrepResult {
     /// Convert a core `GrepResult` into a heap-allocated `FffGrepResult`.
     pub fn from_core(result: &GrepResult, picker: &FilePicker) -> *mut Self {
+        Self::with_pattern_indexes(result, Vec::new(), picker)
+    }
+
+    /// Convert an overlapping multi-pattern result, keeping its flat pattern index array.
+    pub fn from_overlapping(result: OverlappingGrepResult, picker: &FilePicker) -> *mut Self {
+        let (result, pattern_indexes) = result.into_parts();
+        Self::with_pattern_indexes(&result, pattern_indexes, picker)
+    }
+
+    fn with_pattern_indexes(
+        result: &GrepResult,
+        pattern_indexes: Vec<u32>,
+        picker: &FilePicker,
+    ) -> *mut Self {
         let items: Vec<FffGrepMatch> = result
             .matches
             .iter()
@@ -460,6 +480,7 @@ impl FffGrepResult {
             })
             .collect();
         let (items_ptr, count) = vec_to_raw(items);
+        let (match_pattern_indexes, match_pattern_indexes_count) = vec_to_raw(pattern_indexes);
 
         Box::into_raw(Box::new(FffGrepResult {
             items: items_ptr,
@@ -473,6 +494,8 @@ impl FffGrepResult {
                 Some(e) => cstring_new(e),
                 None => ptr::null_mut(),
             },
+            match_pattern_indexes,
+            match_pattern_indexes_count,
         }))
     }
 }
@@ -485,20 +508,21 @@ impl FffGrepResult {
 ///
 /// Depending on the function, the payload is delivered through different fields:
 ///
-/// | Function                   | Payload field | Type                          |
-/// |----------------------------|---------------|-------------------------------|
-/// | `fff_create_instance`      | `handle`      | opaque instance pointer       |
-/// | `fff_search`               | `handle`      | `*mut FffSearchResult`        |
-/// | `fff_live_grep`            | `handle`      | `*mut FffGrepResult`          |
-/// | `fff_multi_grep`           | `handle`      | `*mut FffGrepResult`          |
-/// | `fff_get_scan_progress`    | `handle`      | `*mut FffScanProgress`        |
-/// | `fff_health_check`         | `handle`      | `*mut c_char` (JSON string)   |
-/// | `fff_get_historical_query` | `handle`      | `*mut c_char` (string or null)|
-/// | `fff_wait_for_scan`        | `int_value`   | 1 = completed, 0 = timed out  |
-/// | `fff_track_query`          | `int_value`   | 1 = success, 0 = failure      |
-/// | `fff_refresh_git_status`   | `int_value`   | number of files updated       |
-/// | `fff_scan_files`           | (none)        | success flag only             |
-/// | `fff_restart_index`        | (none)        | success flag only             |
+/// | Function                     | Payload field | Type                           |
+/// |------------------------------|---------------|--------------------------------|
+/// | `fff_create_instance`        | `handle`      | opaque instance pointer        |
+/// | `fff_search`                 | `handle`      | `*mut FffSearchResult`         |
+/// | `fff_live_grep`              | `handle`      | `*mut FffGrepResult`           |
+/// | `fff_multi_grep`             | `handle`      | `*mut FffGrepResult`           |
+/// | `fff_multi_grep_overlapping` | `handle`      | `*mut FffGrepResult`           |
+/// | `fff_get_scan_progress`      | `handle`      | `*mut FffScanProgress`         |
+/// | `fff_health_check`           | `handle`      | `*mut c_char` (JSON string)    |
+/// | `fff_get_historical_query`   | `handle`      | `*mut c_char` (string or null) |
+/// | `fff_wait_for_scan`          | `int_value`   | 1 = completed, 0 = timed out   |
+/// | `fff_track_query`            | `int_value`   | 1 = success, 0 = failure       |
+/// | `fff_refresh_git_status`     | `int_value`   | number of files updated        |
+/// | `fff_scan_files`             | (none)        | success flag only              |
+/// | `fff_restart_index`          | (none)        | success flag only              |
 ///
 /// On failure, `success` is false and `error` contains the message.
 #[repr(C)]

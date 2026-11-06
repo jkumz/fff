@@ -788,69 +788,68 @@ pub unsafe extern "C" fn fff_multi_grep_ex(
     after_context: u32,
     classify_definitions: u8,
 ) -> *mut FffResult {
-    let Some(classify_definitions) = fff::DefinitionMode::from_u8(classify_definitions) else {
-        return FffResult::err(
-            "classify_definitions must be 0 (off), 1 (classify), 2 (definition_only), or 3 (usage_only)",
-        );
-    };
-    let inst = match unsafe { instance_ref(fff_handle) } {
-        Ok(i) => i,
-        Err(e) => return e,
-    };
-
-    let patterns_str = match unsafe { cstr_to_str(patterns_joined) } {
-        Some(s) if !s.is_empty() => s,
-        _ => return FffResult::err("patterns_joined is null or empty"),
-    };
-
-    let patterns: Vec<&str> = patterns_str.split('\n').collect();
-    if patterns.is_empty() || patterns.iter().all(|p| p.is_empty()) {
-        return FffResult::err("patterns must not be empty");
+    unsafe {
+        multi_grep_impl(
+            fff_handle,
+            patterns_joined,
+            constraints,
+            max_file_size,
+            max_matches_per_file,
+            smart_case,
+            file_offset,
+            page_limit,
+            time_budget_ms,
+            enforce_time_budget,
+            before_context,
+            after_context,
+            classify_definitions,
+            false,
+        )
     }
+}
 
-    let constraints_str = unsafe { optional_cstr(constraints) };
-
-    let picker_guard = match inst.picker.read() {
-        Ok(g) => g,
-        Err(e) => return FffResult::err(&format!("Failed to acquire file picker lock: {}", e)),
-    };
-
-    let picker = match picker_guard.as_ref() {
-        Some(p) => p,
-        None => {
-            return FffResult::err("File picker not initialized. Call fff_create_instance first.");
-        }
-    };
-
-    // Parse constraints from the optional string (e.g. "*.rs /src/")
-    let parsed_constraints = constraints_str
-        .map(|c| fff::QueryParser::new(fff_query_parser::AiGrepConfig).parse_constraints(c));
-
-    let constraint_refs: &[fff::Constraint<'_>] = match &parsed_constraints {
-        Some(constraints) => constraints,
-        None => &[],
-    };
-
-    let options = fff::GrepSearchOptions {
-        max_file_size: default_u64(max_file_size, 10 * 1024 * 1024),
-        max_matches_per_file: max_matches_per_file as usize,
-        smart_case,
-        casing: None,
-        file_offset: file_offset as usize,
-        page_limit: default_u32(page_limit, 50) as usize,
-        mode: fff::GrepMode::PlainText, // ignored by multi_grep_search
-        time_budget_ms,
-        enforce_time_budget,
-        before_context: before_context as usize,
-        after_context: after_context as usize,
-        classify_definitions,
-        trim_whitespace: false,
-        abort_signal: None,
-    };
-
-    let result = picker.multi_grep(&patterns, constraint_refs, &options);
-    let grep_result = FffGrepResult::from_core(&result, picker);
-    FffResult::ok_handle(grep_result as *mut c_void)
+/// [`fff_multi_grep_ex`] reporting every hit, overlapping ones too (`aa` 3 times on `aaaa`).
+/// Ranges and `col` cover the full line, in end-offset order, and are not capped.
+///
+/// `match_pattern_indexes` holds each range's index in `patterns_joined`, which must
+/// not contain an empty pattern.
+///
+/// ## Safety
+/// Same as [`fff_multi_grep`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fff_multi_grep_overlapping(
+    fff_handle: *mut c_void,
+    patterns_joined: *const c_char,
+    constraints: *const c_char,
+    max_file_size: u64,
+    max_matches_per_file: u32,
+    smart_case: bool,
+    file_offset: u32,
+    page_limit: u32,
+    time_budget_ms: u64,
+    enforce_time_budget: bool,
+    before_context: u32,
+    after_context: u32,
+    classify_definitions: u8,
+) -> *mut FffResult {
+    unsafe {
+        multi_grep_impl(
+            fff_handle,
+            patterns_joined,
+            constraints,
+            max_file_size,
+            max_matches_per_file,
+            smart_case,
+            file_offset,
+            page_limit,
+            time_budget_ms,
+            enforce_time_budget,
+            before_context,
+            after_context,
+            classify_definitions,
+            true,
+        )
+    }
 }
 
 /// Trigger a rescan of the file index.
@@ -1432,12 +1431,12 @@ pub unsafe extern "C" fn fff_search_result_get_score(
     unsafe { result.scores.add(index as usize) }
 }
 
-/// Free a grep result returned by `fff_live_grep` or `fff_multi_grep`:
-/// the struct, its `items` array, and all strings/ranges/context within.
+/// Free a grep result from `fff_live_grep`, `fff_multi_grep` or `fff_multi_grep_overlapping`:
+/// the struct, its `items` array, pattern indexes, and all strings/ranges/context within.
 ///
 /// ## Safety
-/// `result` must be a valid pointer previously returned via `FffResult.handle`
-/// from `fff_live_grep` or `fff_multi_grep`, or null (no-op).
+/// `result` must be a valid pointer previously returned via `FffResult.handle` from
+/// `fff_live_grep`, `fff_multi_grep` or `fff_multi_grep_overlapping`, or null (no-op).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fff_free_grep_result(result: *mut FffGrepResult) {
     if result.is_null() {
@@ -1457,6 +1456,10 @@ pub unsafe extern "C" fn fff_free_grep_result(result: *mut FffGrepResult) {
         if !result.regex_fallback_error.is_null() {
             drop(CString::from_raw(result.regex_fallback_error));
         }
+        if !result.match_pattern_indexes.is_null() {
+            let n = result.match_pattern_indexes_count as usize;
+            drop(Vec::from_raw_parts(result.match_pattern_indexes, n, n));
+        }
     }
 }
 
@@ -1464,7 +1467,8 @@ pub unsafe extern "C" fn fff_free_grep_result(result: *mut FffGrepResult) {
 /// `index >= count`. Valid until the grep result is freed.
 ///
 /// ## Safety
-/// `result` must be a valid `FffGrepResult` pointer from `fff_live_grep` or `fff_multi_grep`.
+/// `result` must be a valid `FffGrepResult` pointer from `fff_live_grep`, `fff_multi_grep`
+/// or `fff_multi_grep_overlapping`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fff_grep_result_get_match(
     result: *const FffGrepResult,
@@ -1682,4 +1686,157 @@ pub unsafe extern "C" fn fff_mixed_search_result_get_score(
         return std::ptr::null();
     }
     unsafe { result.scores.add(index as usize) }
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn multi_grep_impl(
+    fff_handle: *mut c_void,
+    patterns_joined: *const c_char,
+    constraints: *const c_char,
+    max_file_size: u64,
+    max_matches_per_file: u32,
+    smart_case: bool,
+    file_offset: u32,
+    page_limit: u32,
+    time_budget_ms: u64,
+    enforce_time_budget: bool,
+    before_context: u32,
+    after_context: u32,
+    classify_definitions: u8,
+    overlapping: bool,
+) -> *mut FffResult {
+    let Some(classify_definitions) = fff::DefinitionMode::from_u8(classify_definitions) else {
+        return FffResult::err(
+            "classify_definitions must be 0 (off), 1 (classify), 2 (definition_only), or 3 (usage_only)",
+        );
+    };
+    let inst = match unsafe { instance_ref(fff_handle) } {
+        Ok(i) => i,
+        Err(e) => return e,
+    };
+
+    let patterns_str = match unsafe { cstr_to_str(patterns_joined) } {
+        Some(s) if !s.is_empty() => s,
+        _ => return FffResult::err("patterns_joined is null or empty"),
+    };
+
+    let patterns: Vec<&str> = patterns_str.split('\n').collect();
+    if patterns.is_empty() || patterns.iter().all(|p| p.is_empty()) {
+        return FffResult::err("patterns must not be empty");
+    }
+
+    let constraints_str = unsafe { optional_cstr(constraints) };
+
+    let picker_guard = match inst.picker.read() {
+        Ok(g) => g,
+        Err(e) => return FffResult::err(&format!("Failed to acquire file picker lock: {}", e)),
+    };
+
+    let picker = match picker_guard.as_ref() {
+        Some(p) => p,
+        None => {
+            return FffResult::err("File picker not initialized. Call fff_create_instance first.");
+        }
+    };
+
+    // Parse constraints from the optional string (e.g. "*.rs /src/")
+    let parsed_constraints = constraints_str
+        .map(|c| fff::QueryParser::new(fff_query_parser::AiGrepConfig).parse_constraints(c));
+
+    let constraint_refs: &[fff::Constraint<'_>] = match &parsed_constraints {
+        Some(constraints) => constraints,
+        None => &[],
+    };
+
+    let options = fff::GrepSearchOptions {
+        max_file_size: default_u64(max_file_size, 10 * 1024 * 1024),
+        max_matches_per_file: max_matches_per_file as usize,
+        smart_case,
+        casing: None,
+        file_offset: file_offset as usize,
+        page_limit: default_u32(page_limit, 50) as usize,
+        mode: fff::GrepMode::PlainText, // ignored by multi-pattern search
+        time_budget_ms,
+        enforce_time_budget,
+        before_context: before_context as usize,
+        after_context: after_context as usize,
+        classify_definitions,
+        trim_whitespace: false,
+        abort_signal: None,
+    };
+
+    let grep_result = if overlapping {
+        match picker.multi_grep_overlapping(&patterns, constraint_refs, &options) {
+            Ok(result) => FffGrepResult::from_overlapping(result, picker),
+            Err(fff::Error::EmptyOverlappingPattern) => {
+                return FffResult::err("patterns_joined must not contain an empty pattern");
+            }
+            Err(e) => return FffResult::err(&e.to_string()),
+        }
+    } else {
+        FffGrepResult::from_core(
+            &picker.multi_grep(&patterns, constraint_refs, &options),
+            picker,
+        )
+    };
+    FffResult::ok_handle(grep_result as *mut c_void)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::accessors::{
+        fff_grep_result_get_match_pattern_index, fff_grep_result_get_match_pattern_indexes_count,
+    };
+
+    #[test]
+    fn multi_grep_overlapping_reports_indexes_through_the_accessors() {
+        let dir = std::env::temp_dir().join(format!("fff-c-overlapping-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), "FooBar\nBaz\n").unwrap();
+        let base = CString::new(dir.to_str().unwrap()).unwrap();
+        let opts = FffCreateOptions {
+            base_path: base.as_ptr(),
+            enable_mmap_cache: false,
+            enable_content_indexing: false,
+            watch: false,
+            ..FffCreateOptions::defaults()
+        };
+        let patterns = CString::new("Foo\nFooBar\nBaz").unwrap();
+        unsafe {
+            let created = fff_create_instance_with(&opts);
+            assert!((*created).success);
+            let handle = (*created).handle;
+            fff_free_result(created);
+            fff_free_result(fff_wait_for_scan(handle, 5000));
+
+            let res = fff_multi_grep_overlapping(
+                handle,
+                patterns.as_ptr(),
+                std::ptr::null(),
+                0,
+                0,
+                false,
+                0,
+                0,
+                0,
+                false,
+                0,
+                0,
+                0,
+            );
+            assert!((*res).success);
+            let grep = (*res).handle as *mut FffGrepResult;
+            let count = fff_grep_result_get_match_pattern_indexes_count(grep);
+            let indexes: Vec<u32> = (0..count)
+                .map(|i| *fff_grep_result_get_match_pattern_index(grep, i))
+                .collect();
+            assert_eq!(indexes, vec![0, 1, 2]);
+            assert!(fff_grep_result_get_match_pattern_index(grep, count).is_null());
+            fff_free_grep_result(grep);
+            fff_free_result(res);
+            fff_destroy(handle);
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

@@ -708,8 +708,44 @@ pub unsafe extern "C" fn fff_grep_result_get_filtered_file_count(r: *const FffGr
     unsafe { (*r).filtered_file_count }
 }
 
+/// Number of entries in `match_pattern_indexes`, one per match range of an overlapping
+/// multi-pattern grep; `0` for other greps or if `r` is null.
+///
+/// ## Safety
+/// `r` must be a valid `FffGrepResult` pointer or null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fff_grep_result_get_match_pattern_indexes_count(
+    r: *const FffGrepResult,
+) -> u32 {
+    if r.is_null() {
+        return 0;
+    }
+    unsafe { (*r).match_pattern_indexes_count }
+}
+
+/// Pointer to the `index`-th pattern index, in match then range order; null if `r` is null
+/// or `index >= match_pattern_indexes_count`. Valid until the result is freed; do not free.
+///
+/// ## Safety
+/// `r` must be a valid `FffGrepResult` pointer or null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fff_grep_result_get_match_pattern_index(
+    r: *const FffGrepResult,
+    index: u32,
+) -> *const u32 {
+    if r.is_null() {
+        return ptr::null();
+    }
+    let r = unsafe { &*r };
+    if index >= r.match_pattern_indexes_count {
+        return ptr::null();
+    }
+    unsafe { r.match_pattern_indexes.add(index as usize) }
+}
+
 /// File offset for the next page; `0` if all files have been searched or `r` is null.
-/// Pass as `file_offset` to a subsequent `fff_live_grep`/`fff_multi_grep` call to continue pagination.
+/// Pass as `file_offset` to the next `fff_live_grep`, `fff_multi_grep` or
+/// `fff_multi_grep_overlapping` call to continue pagination.
 ///
 /// ## Safety
 /// `r` must be a valid `FffGrepResult` pointer or null.
@@ -842,6 +878,8 @@ mod tests {
             filtered_file_count: 80,
             next_file_offset: 51,
             regex_fallback_error: ptr::null_mut(),
+            match_pattern_indexes: ptr::null_mut(),
+            match_pattern_indexes_count: 0,
         }
     }
 
@@ -1025,6 +1063,31 @@ mod tests {
             assert_eq!(fff_grep_result_get_filtered_file_count(p), 80);
             assert_eq!(fff_grep_result_get_next_file_offset(p), 51);
             assert!(fff_grep_result_get_regex_fallback_error(p).is_null());
+        }
+    }
+
+    #[test]
+    fn grep_result_pattern_index_getters() {
+        let mut indexes = [1u32, 0, 2];
+        let mut r = make_grep_result();
+        let p = &r as *const FffGrepResult;
+        unsafe {
+            assert_eq!(fff_grep_result_get_match_pattern_indexes_count(p), 0);
+            assert!(fff_grep_result_get_match_pattern_index(p, 0).is_null());
+        }
+        r.match_pattern_indexes = indexes.as_mut_ptr();
+        r.match_pattern_indexes_count = 3;
+        let p = &r as *const FffGrepResult;
+        unsafe {
+            assert_eq!(fff_grep_result_get_match_pattern_indexes_count(p), 3);
+            assert_eq!(*fff_grep_result_get_match_pattern_index(p, 0), 1);
+            assert_eq!(*fff_grep_result_get_match_pattern_index(p, 2), 2);
+            assert!(fff_grep_result_get_match_pattern_index(p, 3).is_null());
+            assert_eq!(
+                fff_grep_result_get_match_pattern_indexes_count(ptr::null()),
+                0
+            );
+            assert!(fff_grep_result_get_match_pattern_index(ptr::null(), 0).is_null());
         }
     }
 }

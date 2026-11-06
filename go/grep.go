@@ -16,7 +16,7 @@ struct fff_go_grep_options {
 	uint8_t classify_definitions;
 };
 
-// The trailing arguments fff_live_grep_ex and fff_multi_grep_ex share.
+// The trailing arguments fff_live_grep_ex, fff_multi_grep_ex and fff_multi_grep_overlapping share.
 #define FFF_GO_GREP_OPTIONS(o) (o)->max_file_size, (o)->max_matches_per_file, (o)->smart_case, \
 	(o)->file_offset, (o)->page_limit, (o)->time_budget_ms, (o)->enforce_time_budget, \
 	(o)->before_context, (o)->after_context, (o)->classify_definitions
@@ -29,6 +29,11 @@ static struct FffResult *fff_go_live_grep(void *handle, const char *query, uint8
 static struct FffResult *fff_go_multi_grep(void *handle, const char *patterns, const char *constraints,
 		const struct fff_go_grep_options *o) {
 	return fff_multi_grep_ex(handle, patterns, constraints, FFF_GO_GREP_OPTIONS(o));
+}
+
+static struct FffResult *fff_go_multi_grep_overlapping(void *handle, const char *patterns,
+		const char *constraints, const struct fff_go_grep_options *o) {
+	return fff_multi_grep_overlapping(handle, patterns, constraints, FFF_GO_GREP_OPTIONS(o));
 }
 */
 import "C"
@@ -95,6 +100,9 @@ type GrepQuery struct {
 type MultiGrepQuery struct {
 	Patterns    []string
 	Constraints string // such as "*.go /src/"
+	// Overlapping reports every hit, overlapping ones too ("aa" 3 times in "aaaa"), and sets
+	// PatternIndexes. Off, hits never overlap and end within Line's first 512 bytes.
+	Overlapping bool
 	GrepOptions
 }
 
@@ -124,14 +132,20 @@ type GrepMatch struct {
 	Line       string
 	LineNumber uint64 // 1-based
 	LineStart  uint64 // byte offset of the line from the start of the file
-	Col        uint32 // byte offset of the first match within the line
-	// Ranges are byte offsets into the raw line and are empty for a match past its 512th byte.
-	Ranges        []MatchRange
-	ContextBefore []string
-	ContextAfter  []string
-	FuzzyScore    uint16
-	HasFuzzyScore bool
-	IsDefinition  bool
+	// Col is the byte offset of the first match within the line. With Overlapping it is
+	// the smallest range start, which need not be Ranges[0].Start.
+	Col uint32
+	// Ranges are byte offsets into the raw line, in end-offset order when Overlapping.
+	// Only Overlapping reports matches past its 512th byte.
+	Ranges []MatchRange
+	// PatternIndexes holds the MultiGrepQuery.Patterns index of each range.
+	// Only an Overlapping MultiGrep sets it.
+	PatternIndexes []uint32
+	ContextBefore  []string
+	ContextAfter   []string
+	FuzzyScore     uint16
+	HasFuzzyScore  bool
+	IsDefinition   bool
 }
 
 // MatchRange holds byte offsets into the matched line, so LineStart+Start is the file offset.
@@ -172,6 +186,9 @@ func (i *Instance) MultiGrep(q MultiGrepQuery) (GrepPage, error) {
 		return GrepPage{}, err
 	}
 	opts := q.c()
+	if q.Overlapping {
+		return grepPage(C.fff_go_multi_grep_overlapping(i.handle, patterns, constraints, &opts))
+	}
 	return grepPage(C.fff_go_multi_grep(i.handle, patterns, constraints, &opts))
 }
 
@@ -207,6 +224,12 @@ func grepPage(res *C.struct_FffResult) (GrepPage, error) {
 	}
 	ranges := make([]MatchRange, 0, nranges)
 	context := make([]string, 0, ncontext)
+	// One entry per range across the page, set only by an overlapping multi-pattern grep.
+	var patternIndexes []uint32
+	if r.match_pattern_indexes_count > 0 {
+		patternIndexes = make([]uint32, r.match_pattern_indexes_count)
+		copy(patternIndexes, unsafe.Slice((*uint32)(unsafe.Pointer(r.match_pattern_indexes)), r.match_pattern_indexes_count))
+	}
 
 	page := GrepPage{
 		Matches:        make([]GrepMatch, len(cmatches)),
@@ -233,6 +256,7 @@ func grepPage(res *C.struct_FffResult) (GrepPage, error) {
 		after := len(context)
 		context = appendStrings(context, c.context_after, c.context_after_count)
 
+		end := len(ranges)
 		page.Matches[k] = GrepMatch{
 			Path:                 path,
 			FileName:             name,
@@ -247,12 +271,15 @@ func grepPage(res *C.struct_FffResult) (GrepPage, error) {
 			LineNumber:           uint64(c.line_number),
 			LineStart:            uint64(c.byte_offset),
 			Col:                  uint32(c.col),
-			Ranges:               ranges[start:len(ranges):len(ranges)],
+			Ranges:               ranges[start:end:end],
 			ContextBefore:        context[before:after:after],
 			ContextAfter:         context[after:len(context):len(context)],
 			FuzzyScore:           uint16(c.fuzzy_score),
 			HasFuzzyScore:        bool(c.has_fuzzy_score),
 			IsDefinition:         bool(c.is_definition),
+		}
+		if patternIndexes != nil {
+			page.Matches[k].PatternIndexes = patternIndexes[start:end:end]
 		}
 	}
 	C.fff_free_grep_result(r)

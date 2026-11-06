@@ -34,7 +34,9 @@ use crate::error::Error;
 use crate::frecency::{FrecencyReader, FrecencyTracker};
 use crate::git::{GitDiscovery, GitStatusCache};
 use crate::git_recency::{self, GitRecencyConfig};
-use crate::grep::{GrepResult, GrepSearchOptions, grep_search, multi_grep_search};
+use crate::grep::{
+    GrepResult, GrepSearchOptions, OverlappingGrepResult, grep_search, multi_grep_search_with,
+};
 use crate::index::{BigramFilter, BigramOverlay};
 use crate::query_tracker::QueryTracker;
 use crate::scan::{ScanConfig, ScanJob, ScanSignals};
@@ -1478,6 +1480,31 @@ impl FilePicker {
         constraints: &[fff_query_parser::Constraint<'_>],
         options: &GrepSearchOptions,
     ) -> GrepResult<'_> {
+        self.multi_grep_with(patterns, constraints, options, false)
+            .expect("only overlapping multi-pattern grep rejects patterns")
+            .0
+    }
+
+    /// [`Self::multi_grep`] reporting every hit, overlapping ones too (`aa` 3 times on `aaaa`),
+    /// over the full line. Fails with [`Error::EmptyOverlappingPattern`] on an empty pattern.
+    pub fn multi_grep_overlapping(
+        &self,
+        patterns: &[&str],
+        constraints: &[fff_query_parser::Constraint<'_>],
+        options: &GrepSearchOptions,
+    ) -> Result<OverlappingGrepResult<'_>, Error> {
+        let (result, pattern_indexes) =
+            self.multi_grep_with(patterns, constraints, options, true)?;
+        Ok(OverlappingGrepResult::new(result, pattern_indexes))
+    }
+
+    fn multi_grep_with(
+        &self,
+        patterns: &[&str],
+        constraints: &[fff_query_parser::Constraint<'_>],
+        options: &GrepSearchOptions,
+        overlapping: bool,
+    ) -> Result<(GrepResult<'_>, Vec<u32>), Error> {
         let overlay_guard = self.sync_data.bigram_overlay.as_ref().map(|o| o.read());
         let arena = self.arena_base_ptr();
         let overflow_arena = self.sync_data.arena_overflow_ptr();
@@ -1487,7 +1514,7 @@ impl FilePicker {
             .unwrap_or(&self.signals.cancelled);
 
         SEARCH_THREAD_POOL.install(|| {
-            multi_grep_search(
+            multi_grep_search_with(
                 self.get_files(),
                 patterns,
                 constraints,
@@ -1499,6 +1526,7 @@ impl FilePicker {
                 &self.base_path,
                 arena,
                 overflow_arena,
+                overlapping,
             )
         })
     }

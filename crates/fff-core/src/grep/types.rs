@@ -47,15 +47,16 @@ pub struct GrepMatch {
     pub file_index: usize,
     /// 1-based line number.
     pub line_number: u64,
-    /// 0-based byte column of first match start within the line.
+    /// 0-based byte column of first match start within the line. Overlapping multi-pattern
+    /// grep gives the smallest start on the full line, not `match_byte_offsets[0].0`.
     pub col: usize,
     /// Absolute byte offset of the matched line from the start of the file.
     /// Can be used by the preview to seek directly without scanning from the top.
     pub byte_offset: u64,
     /// The matched line text, truncated to `MAX_LINE_DISPLAY_LEN`.
     pub line_content: String,
-    /// Byte offsets `(start, end)` within `line_content` for each match.
-    /// Stack-allocated for the common case of ≤4 spans per line.
+    /// Byte offsets `(start, end)` within `line_content` for each match, stack-allocated.
+    /// Overlapping multi-pattern grep reports them against the full, untruncated line.
     pub match_byte_offsets: SmallVec<[(u32, u32); 4]>,
     /// Fuzzy match score from neo_frizbee (only set in Fuzzy grep mode).
     pub fuzzy_score: Option<u16>,
@@ -73,10 +74,18 @@ impl GrepMatch {
     /// adjusting `col` and `match_byte_offsets` so highlights remain correct.
     pub fn trim_leading_whitespace(&mut self) {
         let strip_len = self.line_content.len() - self.line_content.trim_start().len();
+        self.trim_leading(strip_len, strip_len);
+    }
+
+    // Drop `strip_len` bytes from `line_content`, shift `col` and ranges by `range_shift`,
+    // and trim the context lines. Full-line ranges shift by the full line's indentation.
+    pub(super) fn trim_leading(&mut self, strip_len: usize, range_shift: usize) {
         if strip_len > 0 {
             self.line_content.drain(..strip_len);
-            let off = strip_len as u32;
-            self.col = self.col.saturating_sub(strip_len);
+        }
+        if range_shift > 0 {
+            let off = range_shift as u32;
+            self.col = self.col.saturating_sub(range_shift);
             for range in &mut self.match_byte_offsets {
                 range.0 = range.0.saturating_sub(off);
                 range.1 = range.1.saturating_sub(off);
